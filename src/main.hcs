@@ -1,0 +1,24 @@
+#( zst — transpilator Z# (repo: zst). Obecnie: Z# -> PHP 8 (składniowy). )#
+
+import Workspace.cli;
+import transpile;
+
+func usage(): void {
+    println("użycie: zst <plik.zs> [-o <plik.php>]");
+    println("        bez -o wynik trafia na stdout, ostrzeżenia na stderr");
+}
+
+func main(): int {
+    $r = cli.parse(System.args(), ["o"]);
+    if (has_key($r["flags"], "--help") || count($r["positional"]) !== 1) { usage(); return has_key($r["flags"], "--help") ? 0 : 2; }
+    $file = $r["positional"][0];
+    if (!File.exists($file)) { eprintln("zst: nie znaleziono pliku " . $file); return 1; }
+    try { $res = transpile.toPhp(File.read($file)); }
+    catch (Exception $e) { eprintln("zst: " . $file . ": " . $e->getMessage()); return 1; }
+    foreach ($res["warnings"] as $w) { eprintln("zst: " . $w); }
+    $out = $r["options"]["o"] ?? null;
+    if ($out === null) { print($res["php"]); } else { File.write($out, $res["php"]); }
+    return 0;
+}
+
+exit(main());
