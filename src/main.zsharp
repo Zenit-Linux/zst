@@ -1,5 +1,3 @@
-#( zst — transpilator Z# (repo: zst). Obecnie: Z# -> PHP 8 (składniowy). )#
-
 import Workspace.cli;
 import transpile;
 
