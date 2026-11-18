@@ -1,1 +1,10 @@
+[package]
+name = "zst"
+version = "0.0.1"
+kind = "bin"
+entry = "src/main.zsharp"
+description = "Transpilator Z#"
+license = "Apache-2.0"
 
+[dependencies]
+Z-Sharp = { git = "https://github.com/HackerOS-Linux-System/Z-Sharp", path = "Z-Sharp" }
