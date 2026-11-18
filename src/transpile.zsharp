@@ -1,19 +1,3 @@
-#( Transpilator Z# -> PHP 8 (składniowy, oparty o tokeny).
-
-   ZAŁOŻENIE: cel `zst` nie był w specyfikacji zdefiniowany — wybrano PHP, bo składnia Z# z niego
-   wywodzi się; zmiana celu = podmiana tego modułu. Transpilator NIE tłumaczy biblioteki
-   standardowej (System, Math, File...) ani semantyki (ZAMM, domknięcia przez wartość).
-
-   Reguły:
-     func -> function; komentarze liniowe na //, blokowe na /* */, dokumentacyjne na /** */
-     A.b(...)        -> A::b(...)                 A.B.c() -> A\B::c()   A.CONST -> A::CONST   A.prop -> A::$prop
-     using E as $v { } -> $v = E; try { } finally { $v->close(); }
-     import A.b;     -> require_once __DIR__ . '/A/b.php';   (moduły wbudowane -> komentarz)
-     extern "x" {..} -> zakomentowane (PHP nie linkuje statycznie)
-     "..$.."         -> $ w stringach escapowane (Z# nie ma interpolacji)
-   Dostęp przez kropkę jest rozpoznawany tylko bez spacji wokół `.` (A.b), konkatenacja z
-   odstępami (a . b) zostaje konkatenacją. )#
-
 import Workspace.lexer;
 
 namespace transpile;
