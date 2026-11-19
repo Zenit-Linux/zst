@@ -2,6 +2,9 @@ import Workspace.lexer;
 
 namespace transpile;
 
+# Pomocniki PHP odtwarzające semantykę Z# (w jednej linii — numeracja linii programu zostaje zachowana).
+func php_prelude() { return "function __zs_text($v){if($v===null)return'null';if(is_bool($v))return $v?'true':'false';if(is_float($v)){if(is_nan($v))return'NaN';if(is_infinite($v))return $v>0?'Infinity':'-Infinity';return(floor($v)==$v&&abs($v)<1e15)?sprintf('%.1f',$v):rtrim(rtrim(sprintf('%.17g',$v),'0'),'.');}if(is_array($v)){return '['.implode(', ',array_map(function($x){return is_string($x)?json_encode($x,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES):__zs_text($x);},$v)).']';}return(string)$v;} function __zs_echo(...$a){echo implode(' ',array_map('__zs_text',$a)),\"\\n\";} function __zs_necho(...$a){echo implode('',array_map('__zs_text',$a));} function __zs_eecho(...$a){fwrite(STDERR,implode(' ',array_map('__zs_text',$a)).\"\\n\");}"; }
+
 class Builtins {
     const MODULES = ["System" => true, "Math" => true, "File" => true, "Directory" => true, "Process" => true, "Task" => true];
 }
@@ -98,6 +101,18 @@ class Transpiler {
                 $endTok = $a + 2;   # token `{` pochłonięty tutaj
                 $out .= " {";
             }
+            else if ($kind === "kw" && $t["text"] === "echo") {
+                # echo Z#: argumenty rozdzielone spacją + nowa linia, bool/null/float jak w Z# -> wywołanie pomocnika
+                $j = $i + 1; $depth = 0;
+                while ($this->toks[$j]["kind"] !== "eof") {
+                    if ($this->isOp($j, "(") || $this->isOp($j, "[") || $this->isOp($j, "{")) { $depth++; }
+                    else if ($this->isOp($j, ")") || $this->isOp($j, "]") || $this->isOp($j, "}")) { $depth--; }
+                    else if ($this->isOp($j, ";") && $depth <= 0) { break; }
+                    $j++;
+                }
+                $out .= "__zs_echo(" . ($j > $i + 1 ? $this->range($i + 1, $j) : "") . ")";
+                $endTok = $j - 1;
+            }
             else if ($kind === "kw" && $t["text"] === "await") {
                 $this->warnings[] = "linia " . $t["line"] . ": await bez odpowiednika w PHP";
                 $out .= "await";
@@ -118,7 +133,7 @@ class Transpiler {
                     $j += 2;
                 }
                 $np = count($parts);
-                if ($np < 2) { $out .= $t["text"]; }
+                if ($np < 2) { $out .= $t["text"] === "eecho" ? "__zs_eecho" : ($t["text"] === "necho" ? "__zs_necho" : $t["text"]); }
                 else {
                     $last = $parts[$np - 1];
                     $ns = join(array_slice($parts, 0, $np - 1), "\\");
@@ -142,7 +157,7 @@ class Transpiler {
 func toPhp($src) {
     $tp = new Transpiler($src);
     $body = $tp->range(0, count($tp->toks));
-    return ["php" => "<?php\n" . ltrimNl($body), "warnings" => $tp->warnings];
+    return ["php" => "<?php " . php_prelude() . "\n" . ltrimNl($body), "warnings" => $tp->warnings];
 }
 
 func ltrimNl($s) {
