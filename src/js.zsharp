@@ -1,0 +1,398 @@
+namespace js;
+
+import Workspace.ir;
+
+##
+ * Cel `js`: Z# IR (podzbiór natywny) -> JavaScript (Node >= 16) na runtime/zs_runtime.js.
+ * try/catch/finally i pętle mapowane wprost na JS (etykiety dla break/continue N).
+##
+class JsEmitter {
+    public $ir;
+    public $temps;
+    public $loops;
+    public $loopId;
+    public $curFunc;
+    public $tmpN;
+
+    public func __construct($ir) {
+        $this->ir = $ir;
+        $this->temps = [];
+        $this->loops = [];
+        $this->loopId = 0;
+        $this->curFunc = "";
+        $this->tmpN = 0;
+    }
+
+    func tmp() { $this->tmpN++; $n = "_t" . $this->tmpN; $this->temps[] = $n; return $n; }
+
+    func str($s) {
+        $o = "\"";
+        foreach (chars($s) as $c) {
+            if ($c === "\\") { $o .= "\\\\"; }
+            else if ($c === "\"") { $o .= "\\\""; }
+            else if ($c === "\n") { $o .= "\\n"; }
+            else if ($c === "\r") { $o .= "\\r"; }
+            else if ($c === "\t") { $o .= "\\t"; }
+            else if (strlen($c) === 1 && (ord($c) < 32 || ord($c) === 127)) { $o .= "\\u00" . pad_left(to_hex(ord($c)), 2, "0"); }
+            else { $o .= $c; }
+        }
+        return $o . "\"";
+    }
+
+    func v($n) { return "v_" . $n; }
+    func isLval($e) { return $e[0] === ":Var" || $e[0] === ":Index"; }
+
+    func val($e) {
+        $x = $this->expr($e);
+        return $this->isLval($e) ? "Z.dup(" . $x . ")" : $x;
+    }
+
+    func binop($op, $a, $b) {
+        $m = ["Add" => "add", "Sub" => "sub", "Mul" => "mul", "Div" => "div", "Mod" => "mod", "Pow" => "pow", "Concat" => "concat", "BitAnd" => "bitand", "BitOr" => "bitor", "BitXor" => "bitxor", "Shl" => "shl", "Shr" => "shr"];
+        if (has_key($m, $op)) { return "Z." . $m[$op] . "(" . $a . ", " . $b . ")"; }
+        if ($op === "Eq") { return "Z.eq(" . $a . ", " . $b . ")"; }
+        if ($op === "NotEq") { return "!Z.eq(" . $a . ", " . $b . ")"; }
+        if ($op === "Identical") { return "Z.ident(" . $a . ", " . $b . ")"; }
+        if ($op === "NotIdentical") { return "!Z.ident(" . $a . ", " . $b . ")"; }
+        $c = ["Lt" => "<", "Gt" => ">", "Le" => "<=", "Ge" => ">="];
+        if (has_key($c, $op)) { return "(Z.cmp(" . $a . ", " . $b . ") " . $c[$op] . " 0)"; }
+        if ($op === "Xor") { return "(Z.truthy(" . $a . ") !== Z.truthy(" . $b . "))"; }
+        throw new Exception("zst/js: nieobsługiwany operator " . $op);
+    }
+
+    func quiet($e) {
+        if ($e[0] === ":Index" && $e[3] !== null) { return "Z.indexOpt(" . $this->quiet($e[2]) . ", " . $this->expr($e[3]) . ")"; }
+        return $this->expr($e);
+    }
+
+    func lv($base) {
+        if ($base[0] === ":Var") { return "(" . $this->v($base[2]) . " = Z.wr(" . $this->v($base[2]) . "))"; }
+        $p = $this->lv($base[2]);
+        if ($base[3] === null) { return "Z.wrappend(" . $p . ")"; }
+        return "Z.wrelem(" . $p . ", " . $this->expr($base[3]) . ")";
+    }
+
+    func incdec($e) {
+        $t = $e[2];
+        $fn = $e[3] ? "add" : "sub";
+        if ($t[0] === ":Var") {
+            $x = $this->v($t[2]);
+            if ($e[4]) { return "(" . $x . " = Z." . $fn . "(" . $x . ", 1))"; }
+            $o = $this->tmp();
+            return "((" . $o . " = " . $x . "), (" . $x . " = Z." . $fn . "(" . $o . ", 1)), " . $o . ")";
+        }
+        $a = $this->tmp(); $k = $this->tmp(); $o = $this->tmp();
+        return "((" . $a . " = " . $this->lv($t[2]) . "), (" . $k . " = " . $this->expr($t[3]) . "), (" . $o . " = Z.index(" . $a . ", " . $k . ")), Z.aset(" . $a . ", " . $k . ", Z." . $fn . "(" . $o . ", 1)), " . ($e[4] ? "Z." . $fn . "(" . $o . ", 1)" : $o) . ")";
+    }
+
+    func assignop($e) {
+        $op = $e[2];
+        $t = $e[3];
+        if ($t[0] === ":Var") {
+            $x = $this->v($t[2]);
+            if ($op === "Coalesce") { $c = $this->tmp(); return "(" . $x . " = ((" . $c . " = " . $x . ") !== null ? " . $c . " : " . $this->val($e[4]) . "))"; }
+            return "(" . $x . " = " . $this->binop($op, $x, $this->expr($e[4])) . ")";
+        }
+        $a = $this->tmp(); $k = $this->tmp(); $o = $this->tmp();
+        $head = "(" . $a . " = " . $this->lv($t[2]) . "), (" . $k . " = " . ($t[3] === null ? "Z.B.count(" . $a . ")" : $this->expr($t[3])) . ")";
+        if ($op === "Coalesce") {
+            return "(" . $head . ", (" . $o . " = Z.indexOpt(" . $a . ", " . $k . ")), Z.aset(" . $a . ", " . $k . ", " . $o . " !== null ? " . $o . " : " . $this->val($e[4]) . "))";
+        }
+        return "(" . $head . ", (" . $o . " = Z.index(" . $a . ", " . $k . ")), Z.aset(" . $a . ", " . $k . ", " . $this->binop($op, $o, $this->expr($e[4])) . "))";
+    }
+
+    func assign($e) {
+        $t = $e[2];
+        if ($t[0] === ":Var") { return "(" . $this->v($t[2]) . " = " . $this->val($e[3]) . ")"; }
+        $a = $this->lv($t[2]);
+        if ($t[3] === null) { return "Z.apush(" . $a . ", " . $this->val($e[3]) . ")"; }
+        return "Z.aset(" . $a . ", " . $this->expr($t[3]) . ", " . $this->val($e[3]) . ")";
+    }
+
+    func call($e) {
+        $callee = $e[2];
+        $list = $e[3];
+        $n = count($list);
+        if ($callee[0] === ":Prop") { return "Z.getMessage(" . $this->expr($callee[2]) . ")"; }
+        if ($callee[0] === ":Name") {
+            $name = $callee[2];
+            $a = [];
+            if (has_key($this->ir["funcs"], $name)) {
+                $f = $this->ir["funcs"][$name];
+                foreach ($list as $x) { $a[] = $this->val($x[3]); }
+                for ($i = $n; $i < count($f["params"]); $i++) { $a[] = $this->expr($f["params"][$i][4]); }
+                return "f_" . $name . "(" . join($a, ", ") . ")";
+            }
+            foreach ($list as $x) { $a[] = $this->expr($x[3]); }
+            if ($name === "echo" || $name === "necho" || $name === "eecho" || $name === "exit" || $name === "dump") { return "Z." . $name . "(" . join($a, ", ") . ")"; }
+            return "Z.B." . $name . "(" . join($a, ", ") . ")";
+        }
+        $m = $callee[2][2];
+        $f = $callee[3];
+        $a = [];
+        foreach ($list as $x) { $a[] = $this->expr($x[3]); }
+        if ($m === "System" && $f === "exit") { return "Z.exit(" . join($a, ", ") . ")"; }
+        return "Z.M." . $m . "." . $f . "(" . join($a, ", ") . ")";
+    }
+
+    func expr($e) {
+        $k = $e[0];
+        if ($k === ":Null") { return "null"; }
+        if ($k === ":Bool") { return $e[2] ? "true" : "false"; }
+        if ($k === ":Int") { return $e[2] < 0 ? "(" . $e[2] . ")" : "" . $e[2]; }
+        if ($k === ":Float") { return "new Z.F(" . strval($e[2]) . ")"; }
+        if ($k === ":Str") { return $this->str($e[2]); }
+        if ($k === ":Var") { return $this->v($e[2]); }
+        if ($k === ":Array") {
+            $r = $this->tmp();
+            $parts = ["(" . $r . " = Z.arrNew())"];
+            foreach ($e[2] as $it) {
+                if ($it[2] === null) { $parts[] = "Z.apush(" . $r . ", " . $this->val($it[3]) . ")"; }
+                else { $parts[] = "Z.aset(" . $r . ", " . $this->expr($it[2]) . ", " . $this->val($it[3]) . ")"; }
+            }
+            $parts[] = $r;
+            return "(" . join($parts, ", ") . ")";
+        }
+        if ($k === ":Index") {
+            if ($e[3] === null) { throw new Exception("zst/js: odczyt `[]` niedozwolony (linia " . $e[1] . ")"); }
+            return "Z.index(" . $this->expr($e[2]) . ", " . $this->expr($e[3]) . ")";
+        }
+        if ($k === ":Unary") {
+            $x = $this->expr($e[3]);
+            if ($e[2] === "Not") { return "!Z.truthy(" . $x . ")"; }
+            if ($e[2] === "Neg") { return "Z.neg(" . $x . ")"; }
+            if ($e[2] === "BitNot") { return "Z.bitnot(" . $x . ")"; }
+            return $x;
+        }
+        if ($k === ":Binary") {
+            $op = $e[2];
+            if ($op === "And") { return "(Z.truthy(" . $this->expr($e[3]) . ") && Z.truthy(" . $this->expr($e[4]) . "))"; }
+            if ($op === "Or") { return "(Z.truthy(" . $this->expr($e[3]) . ") || Z.truthy(" . $this->expr($e[4]) . "))"; }
+            if ($op === "Coalesce") { $t = $this->tmp(); return "(((" . $t . " = " . $this->quiet($e[3]) . ") !== null) ? " . $t . " : " . $this->val($e[4]) . ")"; }
+            return $this->binop($op, $this->expr($e[3]), $this->expr($e[4]));
+        }
+        if ($k === ":Assign") { return $this->assign($e); }
+        if ($k === ":AssignOp") { return $this->assignop($e); }
+        if ($k === ":IncDec") { return $this->incdec($e); }
+        if ($k === ":Ternary") {
+            if ($e[3] === null) { $t = $this->tmp(); return "(Z.truthy(" . $t . " = " . $this->expr($e[2]) . ") ? " . $t . " : " . $this->expr($e[4]) . ")"; }
+            return "(Z.truthy(" . $this->expr($e[2]) . ") ? " . $this->expr($e[3]) . " : " . $this->expr($e[4]) . ")";
+        }
+        if ($k === ":Call") { return $this->call($e); }
+        throw new Exception("zst/js: wyrażenie " . $k . " (linia " . $e[1] . ")");
+    }
+
+    # ── instrukcje ──
+    func block($list, $ind) {
+        $out = [];
+        foreach ($list as $s) { foreach ($this->stmt($s, $ind) as $l) { $out[] = $l; } }
+        return $out;
+    }
+
+    func pushLoop($kind) { $this->loopId++; $this->loops[] = [$this->loopId, $kind]; return $this->loopId; }
+    func popLoop() { $this->loops = array_slice($this->loops, 0, count($this->loops) - 1); }
+
+    func stmt($s, $ind) {
+        $k = $s[0];
+        $line = $s[1];
+        $p = repeat("  ", $ind);
+        $L = $p . "Z.setLine(" . $line . ");";
+        if ($k === ":Expr") { return [$L, $p . $this->expr($s[2]) . ";"]; }
+        if ($k === ":Echo") {
+            $a = [];
+            foreach ($s[2] as $e) { $a[] = $this->expr($e); }
+            return [$L, $p . "Z.echo(" . join($a, ", ") . ");"];
+        }
+        if ($k === ":Block") { return $this->block($s[2], $ind); }
+        if ($k === ":If") {
+            $o = [$L, $p . "if (Z.truthy(" . $this->expr($s[2]) . ")) {"];
+            foreach ($this->block($s[3], $ind + 1) as $l) { $o[] = $l; }
+            if ($s[4] !== null) {
+                $o[] = $p . "} else {";
+                foreach ($this->block($s[4], $ind + 1) as $l) { $o[] = $l; }
+            }
+            $o[] = $p . "}";
+            return $o;
+        }
+        if ($k === ":While") {
+            $id = $this->pushLoop("loop");
+            $o = [$p . "L" . $id . ": while (true) {", $p . "  Z.setLine(" . $line . ");", $p . "  if (!Z.truthy(" . $this->expr($s[2]) . ")) break;"];
+            foreach ($this->block($s[3], $ind + 1) as $l) { $o[] = $l; }
+            $o[] = $p . "}";
+            $this->popLoop();
+            return $o;
+        }
+        if ($k === ":DoWhile") {
+            $id = $this->pushLoop("loop");
+            $o = [$p . "L" . $id . ": do {"];
+            foreach ($this->block($s[2], $ind + 1) as $l) { $o[] = $l; }
+            $o[] = $p . "  Z.setLine(" . $line . ");";
+            $o[] = $p . "} while (Z.truthy(" . $this->expr($s[3]) . "));";
+            $this->popLoop();
+            return $o;
+        }
+        if ($k === ":For") {
+            $id = $this->pushLoop("loop");
+            $o = [];
+            foreach ($s[2] as $e) { $o[] = $L; $o[] = $p . $this->expr($e) . ";"; }
+            $cond = $s[3] === null ? "true" : "Z.truthy(" . $this->expr($s[3]) . ")";
+            $step = [];
+            foreach ($s[4] as $e) { $step[] = $this->expr($e); }
+            $o[] = $p . "L" . $id . ": for (; " . $cond . "; " . (count($step) > 0 ? join($step, ", ") : "") . ") {";
+            foreach ($this->block($s[5], $ind + 1) as $l) { $o[] = $l; }
+            $o[] = $p . "}";
+            $this->popLoop();
+            return $o;
+        }
+        if ($k === ":Foreach") {
+            $id = $this->pushLoop("loop");
+            $it = "_it" . $id;
+            $o = [$L, $p . "{", $p . "  const " . $it . " = Z.foreachArr(" . $this->val($s[2]) . ");",
+                  $p . "  L" . $id . ": for (let _i" . $id . " = 0; _i" . $id . " < " . $it . ".keys.length; _i" . $id . "++) {",
+                  $p . "    " . $this->v($s[4]) . " = " . $it . ".vals[_i" . $id . "];"];
+            if ($s[3] !== null) { $o[] = $p . "    " . $this->v($s[3]) . " = " . $it . ".keys[_i" . $id . "];"; }
+            foreach ($this->block($s[5], $ind + 2) as $l) { $o[] = $l; }
+            $o[] = $p . "  }";
+            $o[] = $p . "}";
+            $this->popLoop();
+            return $o;
+        }
+        if ($k === ":Switch") {
+            $id = $this->pushLoop("switch");
+            $sv = "_sw" . $id;
+            $cv = "_sc" . $id;
+            $o = [$L, $p . "{", $p . "  const " . $sv . " = " . $this->expr($s[2]) . ";", $p . "  let " . $cv . " = -1;"];
+            $def = -1;
+            $first = true;
+            $i = 0;
+            foreach ($s[3] as $c) {
+                if ($c[2] === null) { $def = $i; }
+                else {
+                    $o[] = $p . "  " . ($first ? "" : "else ") . "if (Z.eq(" . $sv . ", " . $this->expr($c[2]) . ")) " . $cv . " = " . $i . ";";
+                    $first = false;
+                }
+                $i++;
+            }
+            if ($def >= 0) { $o[] = $p . "  " . ($first ? "" : "else ") . $cv . " = " . $def . ";"; }
+            $o[] = $p . "  L" . $id . ": switch (" . $cv . ") {";
+            $i = 0;
+            foreach ($s[3] as $c) {
+                $o[] = $p . "    case " . $i . ": {";
+                foreach ($this->block($c[3], $ind + 3) as $l) { $o[] = $l; }
+                $o[] = $p . "    }";
+                $i++;
+            }
+            $o[] = $p . "  }";
+            $o[] = $p . "}";
+            $this->popLoop();
+            return $o;
+        }
+        if ($k === ":Return") {
+            $v = $s[2] === null ? "null" : $this->val($s[2]);
+            $ret = $this->ir["funcs"][$this->curFunc]["ret"] ?? [];
+            if (count($ret) === 1 && in_array($ret[0], IrTables.SIMPLE_TYPES)) {
+                $v = "Z.chk(" . $v . ", " . $this->str($ret[0]) . ", " . $this->str("wartość zwracana funkcji " . $this->curFunc) . ")";
+            }
+            return [$L, $p . "return " . $v . ";"];
+        }
+        if ($k === ":Break" || $k === ":Continue") {
+            $i = count($this->loops) - $s[2];
+            if ($i < 0) { throw new Exception("zst/js: break/continue " . $s[2] . " poza pętlą (linia " . $line . ")"); }
+            $lp = $this->loops[$i];
+            $kw = ($k === ":Break" || $lp[1] === "switch") ? "break" : "continue";
+            return [$p . $kw . " L" . $lp[0] . ";"];
+        }
+        if ($k === ":Try") {
+            $o = [$p . "try {"];
+            foreach ($this->block($s[2], $ind + 1) as $l) { $o[] = $l; }
+            if (count($s[3]) > 0) {
+                $o[] = $p . "} catch (_e) {";
+                $o[] = $p . "  _e = Z.toExc(_e);";
+                $first = true;
+                foreach ($s[3] as $c) {
+                    $conds = [];
+                    foreach ($c[2] as $t) { $conds[] = ($t === "Throwable" || $t === "Exception") ? "true" : "Z.excIs(_e, 1)"; }
+                    $o[] = $p . "  " . ($first ? "" : "else ") . "if (" . join($conds, " || ") . ") {";
+                    if ($c[3] !== null) { $o[] = $p . "    " . $this->v($c[3]) . " = _e;"; }
+                    foreach ($this->block($c[4], $ind + 2) as $l) { $o[] = $l; }
+                    $o[] = $p . "  }";
+                    $first = false;
+                }
+                $o[] = $p . "  else throw _e;";
+            }
+            if ($s[4] !== null) {
+                $o[] = $p . "} finally {";
+                foreach ($this->block($s[4], $ind + 1) as $l) { $o[] = $l; }
+            }
+            $o[] = $p . "}";
+            return $o;
+        }
+        if ($k === ":Throw") {
+            $x = $s[2];
+            if ($x[0] === ":New") {
+                $msg = count($x[3]) > 0 ? $this->expr($x[3][0][3]) : "\"\"";
+                return [$L, $p . "Z.raise(new Z.ZExc(" . ($x[2] === "Error" ? "1" : "0") . ", " . $msg . "));"];
+            }
+            return [$L, $p . "Z.throwV(" . $this->expr($x) . ");"];
+        }
+        throw new Exception("zst/js: instrukcja " . $k . " (linia " . $line . ")");
+    }
+
+    func decl($names) {
+        if (count($names) === 0) { return []; }
+        $parts = [];
+        foreach ($names as $n) { $parts[] = $n . " = null"; }
+        return ["  let " . join($parts, ", ") . ";"];
+    }
+
+    func funcDef($name) {
+        $f = $this->ir["funcs"][$name];
+        $this->curFunc = $name;
+        $this->temps = [];
+        $this->loops = [];
+        $params = [];
+        $pn = [];
+        foreach ($f["params"] as $p) { $params[] = $this->v($p[2]); $pn[] = $p[2]; }
+        $body = [];
+        foreach ($f["params"] as $p) {
+            if (count($p[3]) === 1 && in_array($p[3][0], IrTables.SIMPLE_TYPES)) {
+                $body[] = "  " . $this->v($p[2]) . " = Z.chk(" . $this->v($p[2]) . ", " . $this->str($p[3][0]) . ", " . $this->str("argument $" . $p[2] . " funkcji " . $name) . ");";
+            }
+        }
+        foreach ($this->block($f["body"], 1) as $l) { $body[] = $l; }
+        $loc = [];
+        foreach ($f["locals"] as $n) { if (!in_array($n, $pn)) { $loc[] = $this->v($n); } }
+        $o = ["function f_" . $name . "(" . join($params, ", ") . ") {"];
+        foreach ($this->decl($loc) as $l) { $o[] = $l; }
+        foreach ($this->decl($this->temps) as $l) { $o[] = $l; }
+        foreach ($body as $l) { $o[] = $l; }
+        $o[] = "  return null;";
+        $o[] = "}";
+        return $o;
+    }
+
+    func generate($runtimeRef) {
+        $ir = $this->ir;
+        $o = ["// wygenerowane przez zst (cel js) — nie edytuj", "\"use strict\";", "const Z = " . $runtimeRef . ";"];
+        foreach ($ir["order"] as $name) { foreach ($this->funcDef($name) as $l) { $o[] = $l; } }
+        $this->curFunc = "";
+        $this->temps = [];
+        $this->loops = [];
+        $body = $this->block($ir["top"], 1);
+        $loc = [];
+        foreach ($ir["toplocals"] as $n) { $loc[] = $this->v($n); }
+        $o[] = "function zs_top() {";
+        foreach ($this->decl($loc) as $l) { $o[] = $l; }
+        foreach ($this->decl($this->temps) as $l) { $o[] = $l; }
+        foreach ($body as $l) { $o[] = $l; }
+        $o[] = "}";
+        $hasMain = has_key($ir["funcs"], "main");
+        $o[] = "Z.run(zs_top, " . ($hasMain ? "f_main" : "null") . ", " . ($ir["calls_main"] ? "true" : "false") . ");";
+        return join($o, "\n") . "\n";
+    }
+}
+
+func generate($ir, $runtimeRef) {
+    $em = new JsEmitter($ir);
+    return $em->generate($runtimeRef);
+}
