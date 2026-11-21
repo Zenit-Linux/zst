@@ -7,4 +7,4 @@ description = "Transpilator Z#"
 license = "Apache-2.0"
 
 [dependencies]
-Z-Sharp = { git = "https://github.com/HackerOS-Linux-System/Z-Sharp", path = "Z-Sharp" }
+Z-Sharp = { git = "https://github.com/Zenit-Linux/Z-Sharp", path = "Z-Sharp" }
