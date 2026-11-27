@@ -139,8 +139,20 @@ class JsEmitter {
         $k = $e[0];
         if ($k === ":Null") { return "null"; }
         if ($k === ":Bool") { return $e[2] ? "true" : "false"; }
-        if ($k === ":Int") { return $e[2] < 0 ? "(" . $e[2] . ")" : "" . $e[2]; }
-        if ($k === ":Float") { return "new Z.F(" . strval($e[2]) . ")"; }
+        if ($k === ":Int") {
+            $big = ($e[2] > 9007199254740991 || $e[2] < -9007199254740991) ? "n" : "";
+            return $e[2] < 0 ? "(" . $e[2] . $big . ")" : "" . $e[2] . $big;
+        }
+        if ($k === ":Float") {
+            $fs = strval($e[2]);
+            if (contains($fs, "nan") || contains($fs, "NaN")) { return "new Z.F(NaN)"; }
+            if (contains($fs, "inf") || contains($fs, "Infinity")) { return starts_with($fs, "-") ? "new Z.F(-Infinity)" : "new Z.F(Infinity)"; }
+            return "new Z.F(" . $fs . ")";
+        }
+        if ($k === ":New") {
+            $msg = count($e[3]) > 0 ? $this->expr($e[3][0][3]) : "\"\"";
+            return "new Z.ZExc(" . ($e[2] === "Error" ? "1" : "0") . ", " . $msg . ")";
+        }
         if ($k === ":Str") { return $this->str($e[2]); }
         if ($k === ":Var") { return $this->v($e[2]); }
         if ($k === ":Array") {
