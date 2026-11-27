@@ -6,6 +6,8 @@ import Workspace.link;
 import Workspace.emit_c;
 import transpile;
 import js;
+import php;
+import flat;
 
 ##
  * zst — transpilator Z#. Cele:
@@ -14,21 +16,36 @@ import js;
  *   c              : samodzielny plik C11 (podzbiór natywny; runtime wklejony), kompilacja: cc -O2 plik.c -lm
 ##
 
-func version(): string { return "zst 0.0.1"; }
+func version(): string { return "zst 0.2.0"; }
+
+func targets() { return ["js", "php", "c", "rust", "cpp", "php-src"]; }
 
 func usage(): void {
-    echo "użycie: zst [--to php|js|c] [-o <wyjście>] [--bundle] [--run] <plik.zs>";
-    echo "  --to       cel (domyślnie php); --list-targets";
-    echo "  -o         plik wyjściowy (bez -o: stdout, ostrzeżenia na stderr)";
-    echo "  --bundle   js: wklej runtime do pliku (jeden plik, bez require)";
-    echo "  --run      uruchom wynik (php / node / cc) i zwróć jego kod wyjścia";
-    echo "  --check    tylko sprawdź, czy program mieści się w celu (kod 3 gdy nie)";
+    echo "zst — transpilator Z# (pełny język przez linker modułów + IR)";
+    echo "użycie: zst --to <cel> [-o <wyjście>] [--no-bundle] [--run] [--check] <plik.zs> [-- argumenty programu]";
+    echo "  cele:";
+    echo "    js       Node >= 16, jeden plik (runtime wklejony; --no-bundle: require runtime/zs_runtime.js)";
+    echo "    php      PHP >= 8.1, jeden plik (runtime wklejony; --no-bundle: require_once runtime/zs_runtime.php)";
+    echo "    c        samodzielny plik C11 (runtime wklejony), kompilacja: cc -O2 plik.c -lm";
+    echo "    rust     Rust (rustc >= 1.70, jeden plik, bez zależności): rustc -O --edition 2021 plik.rs";
+    echo "    cpp      C++17 (jeden plik, nagłówkowy runtime): c++ -std=c++17 -O2 plik.cpp";
+    echo "    php-src  tłumaczenie składniowe tokenów (starsze, bez gwarancji semantyki)";
+    echo "  -o        plik wyjściowy (bez -o: stdout, ostrzeżenia na stderr)";
+    echo "  --run     uruchom wynik (node / php / cc) i zwróć jego kod wyjścia";
+    echo "  --check   tylko sprawdź, czy program mieści się w celu (kod 3 gdy nie)";
+    echo "  --list-targets | --version | --help";
     echo "kody: 0 ok, 1 błąd, 2 użycie, 3 konstrukcja nieobsługiwana w celu";
+    echo "zmienne: ZS_HOME (Z-Sharp), ZST_HOME (katalog z runtime/), CC";
 }
 
 func zs_root($scriptDir) {
     $env = System.env("ZS_HOME");
     if ($env !== null && $env !== "") { return $env; }
+    $d = $scriptDir;
+    if (!starts_with($d, "/")) { $d = (System.env("PWD") ?? ".") . "/" . $d; }
+    foreach ([$d . "/../share/z-sharp", $d . "/share/z-sharp"] as $c) {
+        if (File.exists($c . "/runtime/native/zs_rt.c")) { return $c; }
+    }
     $f = System.resolveImport(["Workspace", "cli"], $scriptDir);
     if ($f === null) { return null; }
     return System.dirname(System.dirname($f));
@@ -39,10 +56,18 @@ func abs_path($p) {
     return (System.env("PWD") ?? ".") . "/" . $p;
 }
 
-func zst_home($scriptDir) {
+# plik runtime: ZST_HOME/runtime, obok binarki (../runtime, ../share/zst/runtime), źródła zst
+func find_runtime($scriptDir, $name) {
+    $c = [];
     $e = System.env("ZST_HOME");
-    if ($e !== null && $e !== "") { return $e; }
-    return abs_path($scriptDir) . "/..";
+    if ($e !== null && $e !== "") { $c[] = $e . "/runtime/" . $name; }
+    $d = abs_path($scriptDir);
+    $c[] = $d . "/../runtime/" . $name;
+    $c[] = $d . "/../share/zst/runtime/" . $name;
+    $c[] = $d . "/../share/z-sharp/zst/runtime/" . $name;
+    $c[] = $d . "/runtime/" . $name;
+    foreach ($c as $p) { if (File.exists($p)) { return $p; } }
+    return null;
 }
 
 func lower_ir($file, $src) {
@@ -51,13 +76,13 @@ func lower_ir($file, $src) {
     $lk = link.link($ast, $file);
     if (count($lk["errors"]) > 0) {
         foreach ($lk["errors"] as $e) { eecho($e[3] . ":" . $e[0] . ": błąd [" . $e[1] . "]: " . $e[2]); }
-        eecho("zst: konstrukcje spoza podzbioru celu (jawnie nieobsługiwane)");
+        eecho("zst: konstrukcje spoza zakresu celu (jawnie nieobsługiwane)");
         return 3;
     }
     $res = ir.lower($lk["ast"]);
     if (count($res["errors"]) > 0) {
         foreach ($res["errors"] as $e) { eecho($file . ":" . $e[0] . ": błąd [" . $e[1] . "]: " . $e[2]); }
-        eecho("zst: konstrukcje spoza podzbioru celu (jawnie nieobsługiwane)");
+        eecho("zst: konstrukcje spoza zakresu celu (jawnie nieobsługiwane)");
         return 3;
     }
     return $res;
@@ -66,20 +91,30 @@ func lower_ir($file, $src) {
 func main(): int {
     $argv = System.args();
     $scriptDir = System.dirname($argv[0]);
-    $r = cli.parse($argv, ["o", "to"]);
+    $progArgs = [];
+    $own = [];
+    $seenDD = false;
+    foreach ($argv as $i => $a) {
+        if ($i === 0) { $own[] = $a; continue; }
+        if ($seenDD) { $progArgs[] = $a; continue; }
+        if ($a === "--") { $seenDD = true; continue; }
+        $own[] = $a;
+    }
+    $r = cli.parse($own, ["o", "to"]);
     $fl = $r["flags"];
     if (has_key($fl, "--version")) { echo version(); return 0; }
-    if (has_key($fl, "--list-targets")) { echo "php\njs\nc"; return 0; }
+    if (has_key($fl, "--list-targets")) { echo join(targets(), "\n"); return 0; }
     if (has_key($fl, "--help") || has_key($fl, "-h")) { usage(); return 0; }
     if (count($r["positional"]) !== 1) { usage(); return 2; }
     $to = $r["options"]["to"] ?? "php";
-    if (!in_array($to, ["php", "js", "c"])) { eecho("zst: nieznany cel " . $to . " (php|js|c)"); return 2; }
+    if (!in_array($to, targets())) { eecho("zst: nieznany cel " . $to . " (" . join(targets(), "|") . ")"); return 2; }
     $file = $r["positional"][0];
     if (!File.exists($file)) { eecho("zst: nie znaleziono pliku " . $file); return 1; }
     $src = File.read($file);
     $out = $r["options"]["o"] ?? null;
+    $bundle = !has_key($fl, "--no-bundle");
     $text = "";
-    if ($to === "php") {
+    if ($to === "php-src") {
         try { $res = transpile.toPhp($src); }
         catch (Exception $e) { eecho("zst: " . $file . ": " . $e->getMessage()); return 1; }
         foreach ($res["warnings"] as $w) { eecho("zst: " . $w); }
@@ -91,11 +126,26 @@ func main(): int {
         if (has_key($fl, "--check")) { return 0; }
         try {
             if ($to === "js") {
-                $rt = zst_home($scriptDir) . "/runtime/zs_runtime.js";
-                if (has_key($fl, "--bundle")) {
+                $rt = find_runtime($scriptDir, "zs_runtime.js");
+                if ($rt === null) { eecho("zst: nie znaleziono runtime/zs_runtime.js (ustaw ZST_HOME)"); return 1; }
+                if ($bundle) {
                     $ref = "(function(require){ const module = { exports: {} };\n" . File.read($rt) . "\nreturn module.exports; })(typeof require === 'function' ? require : null)";
                 } else { $ref = "require(" . json_str($rt) . ")"; }
                 $text = js.generate($res, $ref);
+            } else if ($to === "rust" || $to === "cpp") {
+                $rn = $to === "rust" ? "zs_runtime.rs" : "zs_runtime.hpp";
+                $rt = find_runtime($scriptDir, $rn);
+                if ($rt === null) { eecho("zst: nie znaleziono runtime/" . $rn . " (ustaw ZST_HOME)"); return 1; }
+                $text = flat.generate($res, $to, File.read($rt));
+            } else if ($to === "php") {
+                $rt = find_runtime($scriptDir, "zs_runtime.php");
+                if ($rt === null) { eecho("zst: nie znaleziono runtime/zs_runtime.php (ustaw ZST_HOME)"); return 1; }
+                if ($bundle) {
+                    $body = File.read($rt);
+                    if (starts_with($body, "<?php")) { $body = substr($body, 5); }
+                    $ref = $body;
+                } else { $ref = "require_once " . php_str($rt) . ";"; }
+                $text = php.generate($res, $ref);
             } else {
                 $root = zs_root($scriptDir);
                 if ($root === null) { eecho("zst: nie znaleziono Z-Sharp (ustaw ZS_HOME)"); return 1; }
@@ -103,9 +153,13 @@ func main(): int {
             }
         } catch (Exception $e) { eecho("zst: " . $e->getMessage()); return 1; }
     }
-    if (has_key($fl, "--run")) { return run_output($to, $text, $out, $file); }
+    if (has_key($fl, "--run")) { return run_output($to, $text, $out, $progArgs); }
     if ($out === null) { necho($text); } else { File.write($out, $text); }
     return 0;
+}
+
+func php_str($s): string {
+    return "'" . replace(replace($s, "\\", "\\\\"), "'", "\\'") . "'";
 }
 
 func json_str($s): string {
@@ -121,23 +175,41 @@ func c_single_file($root, $prog): string {
     return "/* samodzielny plik C wygenerowany przez zst (cel c): cc -O2 -std=gnu11 plik.c -lm */\n" . $h . "\n/* ---- zs_rt.c ---- */\n" . $c . "\n/* ---- program ---- */\n" . $prog;
 }
 
-func run_output($to, $text, $out, $file): int {
+func run_output($to, $text, $out, $progArgs): int {
     $dir = System.env("TMPDIR") ?? "/tmp";
-    $base = $out ?? ($dir . "/zst-run-" . intval(System.time() * 1000));
-    $ext = $to === "js" ? ".js" : ($to === "php" ? ".php" : ".c");
+    $tdir = $dir . "/zst-run-" . System.pid() . "-" . System.nowNanos();
+    Directory.create($tdir);
+    $base = $out ?? ($tdir . "/prog");
+    $ext = ($to === "js") ? ".js" : (($to === "php" || $to === "php-src") ? ".php" : ($to === "rust" ? ".rs" : ($to === "cpp" ? ".cpp" : ".c")));
     $path = $base . $ext;
     File.write($path, $text);
     $rc = 0;
-    if ($to === "php") { $rc = Process.exec("php", [$path]); }
-    else if ($to === "js") { $rc = Process.exec("node", [$path]); }
-    else {
+    if ($to === "php" || $to === "php-src") {
+        $av = [$path];
+        foreach ($progArgs as $a) { $av[] = $a; }
+        $rc = Process.exec("php", $av);
+    } else if ($to === "js") {
+        $av = [$path];
+        foreach ($progArgs as $a) { $av[] = $a; }
+        $rc = Process.exec("node", $av);
+    } else if ($to === "rust") {
         $exe = $base . ".bin";
-        $b = Process.run("cc", ["-O2", "-std=gnu11", "-w", $path, "-o", $exe, "-lm"]);
-        if ($b["status"] !== 0) { eecho($b["stderr"]); return 1; }
-        $rc = Process.exec($exe, []);
-        File.delete($exe);
+        $b = Process.run(System.env("RUSTC") ?? "rustc", ["-O", "--edition", "2021", "-A", "warnings", $path, "-o", $exe]);
+        if ($b["status"] !== 0) { eecho($b["stderr"]); $rc = 1; }
+        else { $rc = Process.exec($exe, $progArgs); File.delete($exe); }
+    } else if ($to === "cpp") {
+        $exe = $base . ".bin";
+        $b = Process.run(System.env("CXX") ?? "c++", ["-std=c++17", "-O1", "-w", $path, "-o", $exe]);
+        if ($b["status"] !== 0) { eecho($b["stderr"]); $rc = 1; }
+        else { $rc = Process.exec($exe, $progArgs); File.delete($exe); }
+    } else {
+        $exe = $base . ".bin";
+        $cc = System.env("CC") ?? "cc";
+        $b = Process.run($cc, ["-O2", "-std=gnu11", "-w", $path, "-o", $exe, "-lm"]);
+        if ($b["status"] !== 0) { eecho($b["stderr"]); $rc = 1; }
+        else { $rc = Process.exec($exe, $progArgs); File.delete($exe); }
     }
-    if ($out === null) { File.delete($path); }
+    if ($out === null) { File.delete($path); Directory.remove($tdir); }
     return $rc;
 }
 
