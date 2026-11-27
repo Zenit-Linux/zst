@@ -1,23 +1,25 @@
-# zst — transpilator Z# (0.0.1)
+# zst — transpilator Z#
 
-```
-zst [--to php|js|c] [-o wyjście] [--bundle] [--run] [--check] plik.zs
-zst --list-targets | --version | --help
-```
-Kody wyjścia: 0 ok, 1 błąd, 2 użycie, 3 konstrukcja nieobsługiwana w celu (jawny błąd `Exxxx` z linią).
+`zst --to <cel> [-o plik] [--no-bundle] [--run] [--check] prog.zs [-- argumenty]`
 
-| cel | jak działa | pokrycie | zgodność semantyczna z interpreterem |
-|---|---|---|---|
-| `php` (domyślny) | tłumaczenie **składniowe** tokenów (zachowuje układ linii), prelude dla `echo/necho/eecho` | pełna składnia (klasy, importy…) | **niska**: nie odtwarza semantyki wartości tablic, dzielenia int, komunikatów błędów (1/7 testów różnicowych) |
-| `js` | Z# IR → JavaScript (Node ≥ 16) + `runtime/zs_runtime.js` (tablice COW, int/float, wyjątki, wbudowane) | podzbiór natywny (jak `zsc`) | **wysoka**: 6/6 programów w podzbiorze; ograniczenie: `int` to double (dokładny do 2^53, nie int64) |
-| `c` | Z# IR → C11 w **jednym pliku** (nagłówek + runtime wklejone), `cc -O2 plik.c -lm` | podzbiór natywny | **wysoka**: 6/6 (to samo co `zsc`) |
+| cel | wynik | wymaga do uruchomienia |
+|---|---|---|
+| `js` | jeden plik JS (runtime wklejony) | Node >= 16 |
+| `php` | jeden plik PHP | PHP >= 8.1 |
+| `c` | jeden plik C11 (runtime wklejony) | `cc -O2 plik.c -lm` |
+| `cpp` | jeden plik C++17 (nagłówkowy runtime) | `c++ -std=c++17 -O2 plik.cpp` |
+| `rust` | jeden plik Rust, bez zależności | `rustc -O --edition 2021 plik.rs` |
+| `php-src` | starsze tłumaczenie składniowe tokenów | PHP (bez gwarancji semantyki) |
 
-`sample.zsharp` (klasy) → `UNSUPPORTED` dla `js` i `c` (jawnie, kod 3); dla `php` składniowo działa.
-`--bundle` (js) wkleja runtime do pliku. `--run` uruchamia wynik przez `php`/`node`/`cc` i zwraca jego kod wyjścia.
+Wszystkie cele (poza `php-src`) przechodzą przez ten sam front: linker modułów (klasy, domknięcia, `import`) → IR.
+Cele `js/php/cpp/rust` mają własne runtimes w `runtime/` (`zs_runtime.{js,php,hpp,rs}`) z semantyką zgodną z `zs_rt.c`:
+int64 z błędem przepełnienia, napisy bajtowe UTF-8, tablice z kopiowaniem przy zapisie, wyjątki, moduły `Math/System/File/Directory/Process`.
+Cele `cpp` i `rust` korzystają ze wspólnego emitera spłaszczającego (`src/flat.zsharp`).
 
-## Testy
-`tests/run_diff.sh` — tabela program × cel (PASS/FAIL/UNSUPPORTED) względem `zsc0 run`: stdout, stderr i kod wyjścia.
-`TARGETS="js c" STRICT=1 tests/run_diff.sh` kończy się błędem przy jakimkolwiek FAIL.
+Przykłady: `zst --to js prog.zs --run` · `zst --to rust prog.zs -o prog.rs && rustc -O --edition 2021 prog.rs`.
+Runtime znajdowany jest przez `ZST_HOME/runtime`, `<bin>/../runtime`, `<bin>/../share/z-sharp/zst/runtime`.
 
-## Plan
-Cel `php` na IR (semantyka wartości jak w js), potem klasy/domknięcia w IR → wszystkie cele; cele `py`, `go`.
+Weryfikacja: `tests/run.sh` (konformancja każdego celu) oraz samohosting — `zsc` przetranspilowany przez każdy cel
+kompiluje samego siebie do identycznego LLVM IR.
+Ograniczenia: `Socket.*` tylko w celu `c`; w js int64 powyżej 2^53 jest reprezentowany przez BigInt (wolniej); kompilacja dużych
+programów w rust/cpp jest wolna. Kody wyjścia: 0 ok · 1 błąd · 2 użycie · 3 konstrukcja nieobsługiwana w celu.
