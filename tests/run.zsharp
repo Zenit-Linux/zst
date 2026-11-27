@@ -1,0 +1,20 @@
+#!/bin/bash
+# Testy zst: konformancja dla każdego dostępnego celu + zachowanie CLI. Wymaga zst; cele: node (js), php, cc (c), c++ (cpp), rustc (rust).
+HERE=$(cd "$(dirname "$0")" && pwd); ZS=${ZS_HOME:-$HERE/../Z-Sharp}; export ZS_HOME=$ZS
+export ZST_HOME=${ZST_HOME:-$HERE/..}; ZST=${ZST:-zst}; export ZST
+T=$(mktemp -d); trap 'rm -rf "$T"' EXIT; fail=0
+ok() { echo "ok   $1"; }; bad() { echo "FAIL $1"; fail=1; }
+[ "$($ZST --list-targets | tr '\n' ' ')" = "js php c rust cpp php-src " ] && ok "--list-targets" || bad "--list-targets"
+echo 'echo "x"; exit(5);' > $T/e.zs
+for pair in "js:node" "php:php" "c:${CC:-cc}" "cpp:${CXX:-c++}" "rust:${RUSTC:-rustc}"; do
+  t=${pair%%:*}; tool=${pair#*:}
+  if ! command -v $tool >/dev/null; then echo "skip $t (brak $tool)"; continue; fi
+  $ZST --to $t --run $T/e.zs >$T/o 2>/dev/null; rc=$?
+  [ $rc = 5 ] && [ "$(cat $T/o)" = "x" ] && ok "$t: --run, kod wyjścia" || bad "$t: --run, kod wyjścia (rc=$rc)"
+  "$ZS/tests/run_conformance.sh" zst-$t | tail -1 | grep -q " 0 błędów" && ok "$t: konformancja" || bad "$t: konformancja"
+done
+$ZST --to js $T/e.zs -o $T/o.js >/dev/null 2>&1 && ! grep -q "require(\"/" $T/o.js && ok "js: bundle bez zależności od ścieżki" || bad "js: bundle"
+$ZST --to php --no-bundle $T/e.zs -o $T/o.php >/dev/null 2>&1 && grep -q "require_once" $T/o.php && ok "php: --no-bundle" || bad "php: --no-bundle"
+echo 'function (' > $T/b.zs; $ZST --to c $T/b.zs >/dev/null 2>&1; [ $? = 1 ] && ok "błąd składni => 1" || bad "błąd składni => 1"
+$ZST --to nope $T/e.zs >/dev/null 2>&1; [ $? = 2 ] && ok "nieznany cel => 2" || bad "nieznany cel => 2"
+exit $fail
